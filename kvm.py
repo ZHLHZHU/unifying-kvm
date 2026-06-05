@@ -150,10 +150,10 @@ class KeyState:
         return False
 
     def to_ukey(self):
-        """Format current state as a UKEY command line."""
+        """Format current state as a UKEYDOWN command line (no auto-release)."""
         keys_sorted = sorted(self.keys)[:MAX_KEYS]
         tokens = " ".join(f"{k:02X}" for k in keys_sorted)
-        line = f"UKEY {self.modifiers:02X}"
+        line = f"UKEYDOWN {self.modifiers:02X}"
         if tokens:
             line += f" {tokens}"
         return line
@@ -233,7 +233,7 @@ class Forwarder:
         # Release all keys on current target before switching.
         if not self.current_target.is_local and self.key_state.keys or self.key_state.modifiers:
             self.key_state.clear()
-            self.send_cmd("UKEY 00")  # all-up report
+            self.send_cmd("UKEYDOWN 00")  # all-up report
 
         self.target_idx = (self.target_idx + 1) % len(self.targets)
         target = self.current_target
@@ -308,7 +308,7 @@ class Forwarder:
             if not self.current_target.is_local:
                 self.key_state.clear()
                 try:
-                    self.send_cmd("UKEY 00")
+                    self.send_cmd("UKEYDOWN 00")
                 except Exception:
                     pass
             self.ungrab()
