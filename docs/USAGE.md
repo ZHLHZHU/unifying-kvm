@@ -6,14 +6,13 @@
 
 ## 1. 系统概览
 
-```
-                    ┌─ 本机(Pi): 键盘正常工作
-                    │
-物理 USB 键盘 → Pi ─┼─ PC:      键盘通过优联发射到 PC
-                    │
-                    └─ MacBook:  键盘通过优联发射到 MacBook
-
-切换方式: 右Ctrl + Scroll Lock (循环切换)
+```mermaid
+graph LR
+    KB["物理 USB 键盘"] --> Pi["Pi"]
+    Pi -->|本机| LOCAL["本机 (Pi): 键盘正常工作"]
+    Pi -->|PC| PC["PC: 键盘通过优联发射到 PC"]
+    Pi -->|MacBook| Mac["MacBook: 键盘通过优联发射到 MacBook"]
+    HOTKEY["切换方式: 右Ctrl + Scroll Lock (循环切换)"]
 ```
 
 你的键盘始终物理连接在 Pi 上。通过热键,你可以让它的输入:
@@ -35,12 +34,12 @@
 | Logitech Unifying 接收器 | 1-3 | 每台远程目标电脑一个(046d:c52b) |
 
 接线示意:
-```
-[键盘] ──USB──→ [Pi USB口]
-                [Pi USB口] ──USB──→ [nRF52840 开发板]
-                                        ↓ (2.4GHz 无线)
-[PC USB口] ←── [Unifying 接收器 A]
-[Mac USB口] ←── [Unifying 接收器 B]
+```mermaid
+graph LR
+    KB["键盘"] -->|USB| PI_USB1["Pi USB口"]
+    PI_USB2["Pi USB口"] -->|USB| NRF["nRF52840 开发板"]
+    NRF -->|"2.4GHz 无线"| RXA["Unifying 接收器 A"] --> PC["PC USB口"]
+    NRF -->|"2.4GHz 无线"| RXB["Unifying 接收器 B"] --> MAC["Mac USB口"]
 ```
 
 ---

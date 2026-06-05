@@ -4,11 +4,11 @@
 
 ## 原理
 
-```
-物理键盘 → evdev grab → kvm.py → CDC 串口 → nRF52840 → 优联接收器 → 目标 PC/Mac
-                                     ↕
-             右Ctrl + ScrollLock → 切换目标 (本机 ↔ PC ↔ MacBook ↔ ...)
-             本机模式 → 释放 grab, 键盘回归 Pi 本地
+```mermaid
+graph LR
+    KB["物理键盘"] --> GRAB["evdev grab"] --> KVM["kvm.py"] --> CDC["CDC 串口"] --> NRF["nRF52840"] --> RX["优联接收器"] --> TARGET["目标 PC/Mac"]
+    HOTKEY["右Ctrl + ScrollLock"] --> SWITCH["切换目标<br/>(本机 ↔ PC ↔ MacBook ↔ ...)"]
+    LOCAL["本机模式"] --> UNGRAB["释放 grab, 键盘回归 Pi 本地"]
 ```
 
 - **本机模式**:键盘正常工作(ungrab),按键直接到 Pi

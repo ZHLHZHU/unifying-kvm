@@ -6,44 +6,41 @@
 
 ## 1. 总体架构
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                        树莓派 (Python 3)                              │
-│                                                                      │
-│  ┌─────────────┐     ┌──────────────────────────────────────────┐  │
-│  │ 物理 USB    │     │           kvm.py                          │  │
-│  │ 键盘        │────→│                                           │  │
-│  │ (evdev)     │     │  ┌────────┐  ┌──────────┐  ┌──────────┐ │  │
-│  └─────────────┘     │  │KeyState│  │ Forwarder│  │ Target[] │ │  │
-│         ↑            │  │(状态机)│  │ (主循环) │  │(目标列表)│ │  │
-│    grab/ungrab       │  └────┬───┘  └────┬─────┘  └──────────┘ │  │
-│                      │       │           │                       │  │
-│                      │       └─── UKEY ──┘                       │  │
-│                      └───────────────┬───────────────────────────┘  │
-│                                      │ serial (CDC ACM)              │
-└──────────────────────────────────────┼───────────────────────────────┘
-                                       │ USB
-┌──────────────────────────────────────▼───────────────────────────────┐
-│                      nRF52840 固件                                    │
-│  CDC 命令解析 → UKEY → send_encrypted_keystroke → ESB 射频发射        │
-│                  USWITCH → 切换 profile slot + connect                │
-└──────────────────────────────────────┬───────────────────────────────┘
-                                       │ 2.4GHz ESB (Unifying)
-                    ┌──────────────────▼──────────────────┐
-                    │   Logitech Unifying 接收器            │
-                    │   解密 → HID 注入 → 目标电脑         │
-                    └─────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph Pi["树莓派 (Python 3)"]
+        Keyboard["物理 USB 键盘<br/>(evdev)"]
+        subgraph KVM["kvm.py"]
+            KeyState["KeyState<br/>(状态机)"]
+            Forwarder["Forwarder<br/>(主循环)"]
+            Targets["Target[]<br/>(目标列表)"]
+            KeyState -->|UKEY| Forwarder
+        end
+        Keyboard -->|"grab/ungrab"| KVM
+    end
+
+    subgraph NRF["nRF52840 固件"]
+        CDC["CDC 命令解析 → UKEY → send_encrypted_keystroke → ESB 射频发射"]
+        SWITCH["USWITCH → 切换 profile slot + connect"]
+    end
+
+    subgraph Receiver["Logitech Unifying 接收器"]
+        RX["解密 → HID 注入 → 目标电脑"]
+    end
+
+    KVM -->|"serial (CDC ACM) / USB"| NRF
+    NRF -->|"2.4GHz ESB (Unifying)"| Receiver
 ```
 
 核心数据流:
 
-```
-evdev EV_KEY 事件
-  → KeyState.process_event() 更新修饰符/按键集合
-    → KeyState.to_ukey() 格式化为 "UKEY <mod> [keys...]"
-      → serial.write() 发到 nRF52
-        → 固件 AES-CTR 加密 + ESB 射频发送
-          → 接收器解密 + HID 注入
+```mermaid
+graph LR
+    A["evdev EV_KEY 事件"] --> B["KeyState.process_event()<br/>更新修饰符/按键集合"]
+    B --> C["KeyState.to_ukey()<br/>格式化为 UKEY &lt;mod&gt; [keys...]"]
+    C --> D["serial.write()<br/>发到 nRF52"]
+    D --> E["固件 AES-CTR 加密<br/>+ ESB 射频发送"]
+    E --> F["接收器解密<br/>+ HID 注入"]
 ```
 
 ---
@@ -213,11 +210,20 @@ USWITCH <slot-hex>
 
 ### 5.3 通信时序
 
-```
-按键按下 → process_event → to_ukey → serial.write("UKEY 00 04\n")
-                                    ← serial.readline() → "OK\r\n"
-按键释放 → process_event → to_ukey → serial.write("UKEY 00\n")
-                                    ← serial.readline() → "OK\r\n"
+```mermaid
+sequenceDiagram
+    participant App as kvm.py
+    participant FW as nRF52 固件
+
+    Note over App: 按键按下
+    App->>App: process_event → to_ukey
+    App->>FW: serial.write("UKEY 00 04\n")
+    FW-->>App: serial.readline() → "OK\r\n"
+
+    Note over App: 按键释放
+    App->>App: process_event → to_ukey
+    App->>FW: serial.write("UKEY 00\n")
+    FW-->>App: serial.readline() → "OK\r\n"
 ```
 
 每个 UKEY 命令是**同步阻塞**的:发送后等待固件回复 `OK` 或 `ERR SEND`。这保证了严格的时序:前一帧被接收机确认后才发下一帧,不会堆积。
@@ -283,16 +289,13 @@ def switch_target(self):
 
 ### 7.1 状态转换图
 
-```
-                    热键
-    ┌─────────────────────────────────┐
-    │                                 │
-    ▼                                 │
-[LOCAL / Ungrabbed]  ──热键──→  [REMOTE / Grabbed]
-    │                                 │
-    │         热键(循环)              │
-    │                                 ▼
-    └────────────────────────  [REMOTE 2 / Grabbed]
+```mermaid
+stateDiagram-v2
+    [*] --> LOCAL_Ungrabbed
+    LOCAL_Ungrabbed --> REMOTE_Grabbed : 热键
+    REMOTE_Grabbed --> REMOTE2_Grabbed : 热键 (循环)
+    REMOTE2_Grabbed --> LOCAL_Ungrabbed : 热键
+    REMOTE_Grabbed --> LOCAL_Ungrabbed : 热键
 ```
 
 ### 7.2 关键保证
@@ -384,12 +387,18 @@ unifying-kvm/
 
 ## 13. 依赖关系
 
-```
-unifying-kvm (本项目)
-  ├── python3-evdev (键盘事件读取 + grab)
-  ├── pyserial (CDC 串口通信)
-  └── nrf52-unifying 固件 (刷在 nRF52840 上)
-       └── rust-unifying 库 (Unifying 协议实现)
+```mermaid
+graph TD
+    KVM["unifying-kvm (本项目)"]
+    EVDEV["python3-evdev<br/>(键盘事件读取 + grab)"]
+    SERIAL["pyserial<br/>(CDC 串口通信)"]
+    FW["nrf52-unifying 固件<br/>(刷在 nRF52840 上)"]
+    LIB["rust-unifying 库<br/>(Unifying 协议实现)"]
+
+    KVM --> EVDEV
+    KVM --> SERIAL
+    KVM --> FW
+    FW --> LIB
 ```
 
 三个项目各自独立,通过 USB-CDC 串口文本协议松耦合。替换任一层(如用另一种射频方案)只需实现同样的串口命令接口。
