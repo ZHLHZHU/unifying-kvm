@@ -316,15 +316,24 @@ class Forwarder:
 
 
 def find_keyboard(vid_pid):
-    """Find the evdev device path matching a given vendor:product hex string."""
+    """Find the evdev device path matching a given vendor:product hex string.
+
+    A composite USB device (like a keyboard with media keys) registers multiple
+    event nodes. We identify the real keyboard node by checking it has the full
+    set of letter keys (KEY_A..KEY_Z) — only the actual keyboard interface has
+    these; System Control, Consumer Control, and Mouse nodes do not.
+    """
     vid, pid = (int(x, 16) for x in vid_pid.split(":"))
+    alphabet_keys = set(range(ecodes.KEY_A, ecodes.KEY_Z + 1))  # 30..51
+
     for path in sorted(evdev.list_devices()):
         dev = evdev.InputDevice(path)
         if dev.info.vendor == vid and dev.info.product == pid:
-            # Prefer the one with EV_KEY capability
             caps = dev.capabilities(verbose=False)
             if ecodes.EV_KEY in caps:
-                return path
+                key_caps = set(caps[ecodes.EV_KEY])
+                if alphabet_keys.issubset(key_caps):
+                    return path
     return None
 
 
