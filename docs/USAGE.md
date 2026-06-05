@@ -297,11 +297,11 @@ sudo python3 kvm.py ...
 
 2. 确认接收器插在目标电脑上且电脑已开机。
 
-3. 加 `--debug` 看 UKEY 命令是否返回 OK:
+3. 加 `--debug` 看 UKEYDOWN 命令是否返回 OK:
    ```bash
    sudo python3 kvm.py --keyboard 04d9:0024 --debug
    ```
-   应看到每次按键都有 `> UKEY xx xx` / `< OK`。
+   应看到每次按键都有 `> UKEYDOWN xx xx` / `< OK`。
 
 4. 如果看到 `< ERR SEND`,说明射频链路断了。检查:
    - 接收器是否在范围内
@@ -318,7 +318,16 @@ sudo python3 kvm.py ...
 切换目标时转发器会自动发送 all-keys-up 报文。如果仍卡键:
 ```bash
 # 手动释放
-python3 /home/lh/nrf52-unifying/tools/unifying.py raw "UKEY 00"
+python3 /home/lh/nrf52-unifying/tools/unifying.py raw "UKEYDOWN 00"
+```
+
+### 断电后按键被拒(极少见)
+
+如果 nRF52 意外断电后键击被接收器拒绝(counter 回退),固件启动时的 +512 counter 跳跃应能自动恢复。正常情况下重新上电即可继续使用。如果仍然失败,重新配对该 slot:
+
+```bash
+# 在接收器侧打开配对模式,然后:
+python3 /home/lh/nrf52-unifying/tools/unifying.py raw "UPAIR <slot>"
 ```
 
 ---

@@ -14,13 +14,13 @@ graph TD
             KeyState["KeyState<br/>(状态机)"]
             Forwarder["Forwarder<br/>(主循环)"]
             Targets["Target[]<br/>(目标列表)"]
-            KeyState -->|UKEY| Forwarder
+            KeyState -->|UKEYDOWN| Forwarder
         end
         Keyboard -->|"grab/ungrab"| KVM
     end
 
     subgraph NRF["nRF52840 固件"]
-        CDC["CDC 命令解析 → UKEY → send_encrypted_keystroke → ESB 射频发射"]
+        CDC["CDC 命令解析 → UKEYDOWN → send_encrypted_keystroke → ESB 射频发射"]
         SWITCH["USWITCH → 切换 profile slot + connect"]
     end
 
@@ -37,7 +37,7 @@ graph TD
 ```mermaid
 graph LR
     A["evdev EV_KEY 事件"] --> B["KeyState.process_event()<br/>更新修饰符/按键集合"]
-    B --> C["KeyState.to_ukey()<br/>格式化为 UKEY &lt;mod&gt; [keys...]"]
+    B --> C["KeyState.to_ukeydown()<br/>格式化为 UKEYDOWN &lt;mod&gt; [keys...]"]
     C --> D["serial.write()<br/>发到 nRF52"]
     D --> E["固件 AES-CTR 加密<br/>+ ESB 射频发送"]
     E --> F["接收器解密<br/>+ HID 注入"]
@@ -60,7 +60,7 @@ class KeyState:
 | 方法 | 作用 |
 | --- | --- |
 | `process_event(code, value)` | 处理一个 evdev 事件,更新内部状态,返回是否有变化 |
-| `to_ukey()` | 输出当前状态的 `UKEY <mod> [keys...]` 命令字符串 |
+| `to_ukeydown()` | 输出当前状态的 `UKEYDOWN <mod> [keys...]` 命令字符串 |
 | `clear()` | 清空(切换目标时防卡键) |
 
 设计要点:
@@ -77,7 +77,7 @@ class Target:
 ```
 
 - `slot=None`:本机模式,键盘 ungrab,按键正常到 Pi
-- `slot=0..3`:远程模式,键盘 grab,按键通过 `USWITCH <slot>` + `UKEY` 转发
+- `slot=0..3`:远程模式,键盘 grab,按键通过 `USWITCH <slot>` + `UKEYDOWN` 转发
 
 ### 2.3 Forwarder — 主控制器
 
@@ -133,7 +133,7 @@ for event in dev.read_loop():
     # 转发(如果远程模式)
 ```
 
-`read_loop()` 是阻塞式的,一个事件触发一次 `UKEY` 发送。这保证了**每个按键状态变化都精确对应一帧 HID 报文**,不会丢键或乱序。
+`read_loop()` 是阻塞式的,一个事件触发一次 `UKEYDOWN` 发送。这保证了**每个按键状态变化都精确对应一帧 HID 报文**,不会丢键或乱序。
 
 ---
 
@@ -179,21 +179,32 @@ Linux evdev 键码和 USB HID usage ID 是**不同的编号体系**,需要转换
 
 ## 5. 串口通信协议
 
-### 5.1 UKEY 命令格式
+### 5.1 UKEYDOWN 命令格式
+
+KVM 使用 `UKEYDOWN`(而非 `UKEY`)发送键击。区别在于 `UKEYDOWN` 只发按下报文,不自动释放。这对状态式转发至关重要:KVM 每次状态变化发送完整的当前按键集合,由状态变化本身驱动释放。如果使用 `UKEY`(自带 press+release),当多个键重叠按下时,中间状态会各自触发一个完整的 press+release 周期,导致快速打字时出现重复按键。
 
 ```
-UKEY <modifier-hex> [keycode1-hex keycode2-hex ... up to 6]
+UKEYDOWN <modifier-hex> [keycode1-hex keycode2-hex ... up to 6]
 ```
 
 示例:
-- `UKEY 00` — 所有键释放(空报文)
-- `UKEY 00 04` — 按下 'a'(无修饰符)
-- `UKEY 02 04` — Shift + 'a'(= 'A')
-- `UKEY 05 04 05` — Ctrl+Alt + 'a' + 'b'
+- `UKEYDOWN 00` — 所有键释放(空报文)
+- `UKEYDOWN 00 04` — 按下 'a'(无修饰符)
+- `UKEYDOWN 02 04` — Shift + 'a'(= 'A')
+- `UKEYDOWN 05 04 05` — Ctrl+Alt + 'a' + 'b'
 
 每次 KeyState 变化都发送**完整当前状态**(不是增量),这样:
 - 丢一帧不会导致卡键(下一帧会纠正)
 - nRF52 固件端不需要维护状态,只需逐帧加密发射
+
+### 5.2 AES Counter 持久化
+
+nRF52 固件自动处理 AES counter 的持久化,KVM 端无需关心:
+- **周期存储**:`UKEYDOWN` 每 128 帧自动写一次 flash
+- **掉电保护**:nRF52840 POFCON 检测电压下降时紧急写入
+- **启动安全余量**:每次上电从 flash 加载 counter 后自动 +512,覆盖未持久化的增量
+
+因此即使 nRF52 意外断电,重启后 counter 也不会回退,键击不会被接收器拒绝。
 
 ### 5.2 USWITCH 命令
 
@@ -216,19 +227,19 @@ sequenceDiagram
     participant FW as nRF52 固件
 
     Note over App: 按键按下
-    App->>App: process_event → to_ukey
-    App->>FW: serial.write("UKEY 00 04\n")
+    App->>App: process_event → to_ukeydown
+    App->>FW: serial.write("UKEYDOWN 00 04\n")
     FW-->>App: serial.readline() → "OK\r\n"
 
     Note over App: 按键释放
-    App->>App: process_event → to_ukey
-    App->>FW: serial.write("UKEY 00\n")
+    App->>App: process_event → to_ukeydown
+    App->>FW: serial.write("UKEYDOWN 00\n")
     FW-->>App: serial.readline() → "OK\r\n"
 ```
 
-每个 UKEY 命令是**同步阻塞**的:发送后等待固件回复 `OK` 或 `ERR SEND`。这保证了严格的时序:前一帧被接收机确认后才发下一帧,不会堆积。
+每个 UKEYDOWN 命令是**同步阻塞**的:发送后等待固件回复 `OK` 或 `ERR SEND`。这保证了严格的时序:前一帧被接收机确认后才发下一帧,不会堆积。
 
-串口波特率 115200,一条 `UKEY 00 04\n` 约 12 字节 ≈ 1ms 传输时间。加上固件处理+射频发送+ACK,端到端延迟约 **3-8ms**——人感知不到。
+串口波特率 115200,一条 `UKEYDOWN 00 04\n` 约 15 字节 ≈ 1.3ms 传输时间。加上固件处理+射频发送+ACK,端到端延迟约 **3-8ms**——人感知不到。
 
 ---
 
@@ -267,7 +278,7 @@ def is_hotkey(self, code, value):
 def switch_target(self):
     # 1. 释放当前目标上的所有键(防卡键)
     if not current_target.is_local:
-        send("UKEY 00")  # all-keys-up
+        send("UKEYDOWN 00")  # all-keys-up
 
     # 2. 切到下一个目标
     target_idx = (target_idx + 1) % len(targets)
@@ -300,7 +311,7 @@ stateDiagram-v2
 
 ### 7.2 关键保证
 
-- **切换时不漏键**:切之前发 `UKEY 00`(all-up)确保远程目标不会有卡住的键
+- **切换时不漏键**:切之前发 `UKEYDOWN 00`(all-up)确保远程目标不会有卡住的键
 - **切换后状态干净**:清空 `key_state`,新目标从全部释放状态开始
 - **异常退出安全**:`finally` 块保证退出时 ungrab + 释放远程键
 - **本机模式仍读事件**:虽然 ungrab 了,`read_loop()` 仍在运行,这样热键检测始终有效(修饰键状态从事件流中跟踪)
@@ -337,15 +348,15 @@ nRF52 固件在连接态下每 8ms 执行一次 `tick()`(通过 `select(read_pac
 
 `EsbRadio.transmit_payload()` 内置 15 次硬件级重传(250μs 间隔),单帧丢失概率极低。
 
-### 9.3 UKEY 状态式设计
+### 9.3 UKEYDOWN 状态式设计
 
 每帧发**完整状态**(不是增量),所以:
-- 丢一帧 `UKEY`(如 `ERR SEND`)只影响当帧,下一帧自动纠正
+- 丢一帧 `UKEYDOWN`(如 `ERR SEND`)只影响当帧,下一帧自动纠正
 - 不存在"按下了但释放丢了导致卡键"的问题
 
 ### 9.4 切换时 all-up
 
-切换目标前强制发 `UKEY 00`,即使某帧被吞,接收机也不会在旧目标上卡键。
+切换目标前强制发 `UKEYDOWN 00`,即使某帧被吞,接收机也不会在旧目标上卡键。
 
 ---
 
