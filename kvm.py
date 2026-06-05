@@ -241,6 +241,9 @@ class Forwarder:
 
         if target.is_local:
             self.ungrab()
+            # Put the radio to sleep — no need to keep-alive when local.
+            # USWITCH on the next remote switch will wake it back up.
+            self.send_cmd("USLEEP")
         else:
             self.grab()
             # Switch the nRF52 to the correct profile slot and connect.
