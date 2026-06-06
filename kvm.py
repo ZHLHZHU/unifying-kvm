@@ -185,7 +185,7 @@ class Forwarder:
     def open_serial(self):
         if self.ser and self.ser.is_open:
             return
-        self.ser = serial.Serial(self.serial_port, 115200, timeout=1, write_timeout=2)
+        self.ser = serial.Serial(self.serial_port, 115200, timeout=1, write_timeout=10)
         self.ser.dtr = True
         self.ser.rts = True
         time.sleep(0.3)
@@ -200,7 +200,7 @@ class Forwarder:
             self.ser.close()
         self.ser = None
 
-    def send_cmd(self, cmd):
+    def send_cmd(self, cmd, timeout=2):
         """Send a command and read the response line."""
         if not self.ser or not self.ser.is_open:
             self.open_serial()
@@ -208,7 +208,7 @@ class Forwarder:
             print(f"  > {cmd}", file=sys.stderr)
         self.ser.reset_input_buffer()
         self.ser.write(cmd.encode() + b"\n")
-        self.ser.timeout = 2
+        self.ser.timeout = timeout
         resp = self.ser.readline().decode("ascii", errors="replace").strip()
         if self.debug:
             print(f"  < {resp}", file=sys.stderr)
@@ -243,11 +243,11 @@ class Forwarder:
             self.ungrab()
             # Put the radio to sleep — no need to keep-alive when local.
             # USWITCH on the next remote switch will wake it back up.
-            self.send_cmd("USLEEP")
+            self.send_cmd("USLEEP", timeout=5)
         else:
             self.grab()
             # Switch the nRF52 to the correct profile slot and connect.
-            resp = self.send_cmd(f"USWITCH {target.slot:02X}")
+            resp = self.send_cmd(f"USWITCH {target.slot:02X}", timeout=15)
             if self.debug:
                 print(f"  USWITCH -> {resp}", file=sys.stderr)
 
@@ -277,7 +277,7 @@ class Forwarder:
             self.ungrab()
         else:
             self.grab()
-            self.send_cmd(f"USWITCH {target.slot:02X}")
+            self.send_cmd(f"USWITCH {target.slot:02X}", timeout=15)
 
         print("[KVM] Running. Right Ctrl + Scroll Lock to switch targets.")
         print(f"[KVM] Targets: {', '.join(t.name for t in self.targets)}")
