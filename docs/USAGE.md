@@ -12,7 +12,7 @@ graph LR
     Pi -->|本机| LOCAL["本机 (Pi): 键盘正常工作"]
     Pi -->|PC| PC["PC: 键盘通过优联发射到 PC"]
     Pi -->|MacBook| Mac["MacBook: 键盘通过优联发射到 MacBook"]
-    HOTKEY["切换方式: 右Ctrl + Scroll Lock (循环切换)"]
+    HOTKEY["切换方式: Scroll Lock (循环切换)"]
 ```
 
 你的键盘始终物理连接在 Pi 上。通过热键,你可以让它的输入:
@@ -188,7 +188,7 @@ sudo python3 /home/lh/unifying-kvm/kvm.py \
 ```
 Keyboard: My USB Keyboard (/dev/input/event5)
 [KVM] Active target: local
-[KVM] Running. Right Ctrl + Scroll Lock to switch targets.
+[KVM] Running. Scroll Lock to switch targets.
 [KVM] Targets: local, pc, mac
 ```
 
@@ -198,7 +198,7 @@ Keyboard: My USB Keyboard (/dev/input/event5)
 
 ### 6.1 切换目标
 
-按住 **右 Ctrl**,再按 **Scroll Lock**,循环切换到下一个目标:
+按 **Scroll Lock** 键,循环切换到下一个目标:
 
 ```
 local → pc → mac → local → pc → ...
@@ -211,21 +211,34 @@ local → pc → mac → local → pc → ...
 [KVM] Switched to: local
 ```
 
-### 6.2 各模式下的行为
+### 6.2 LED 指示
+
+切换后,物理键盘的 Scroll Lock LED 会闪烁指示当前目标:
+
+| 目标 | 闪烁次数 |
+| --- | --- |
+| PC | 1 次 |
+| Local | 2 次 |
+| Mac | 3 次 |
+
+闪烁结束后 LED 始终熄灭。这让你无需看屏幕就能知道当前输入去向。
+
+### 6.3 各模式下的行为
 
 | 模式 | 键盘状态 | 按键去向 |
 | --- | --- | --- |
-| 本机(local) | 未抓取(ungrab) | Pi 本地正常接收 |
-| 远程(pc/mac) | 独占抓取(grab) | 实时转发到对应接收器 |
+| 本机(local) | 始终 grab(独占) | 通过 uinput 虚拟键盘注入回 Pi |
+| 远程(pc/mac) | 始终 grab(独占) | 实时转发到对应接收器 |
+
+键盘**始终处于 grab 状态**,不论当前目标是本机还是远程。本机模式下通过 uinput 虚拟键盘将按键事件注入回操作系统,这样做是为了确保可靠控制物理键盘的 LED。
 
 远程模式下:
 - 你打的每个键(包括功能键、Ctrl/Alt/Shift 组合)都会实时发到远程电脑
-- 键盘完全被转发器独占,Pi 本地不会收到任何按键
-- 唯一例外是切换热键(右Ctrl+ScrollLock)始终被转发器截获
+- 唯一例外是切换热键(Scroll Lock)始终被转发器截获
 
-### 6.3 退出
+### 6.4 退出
 
-按 `Ctrl+C`(在运行转发器的终端里)。退出时会自动释放所有按住的键并 ungrab 键盘。
+按 `Ctrl+C`(在运行转发器的终端里)。退出时会自动释放所有按住的键、ungrab 键盘并销毁 uinput 设备。
 
 ---
 
@@ -240,6 +253,7 @@ Description=Unifying KVM Keyboard Forwarder
 After=dev-ttyACM0.device
 
 [Service]
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /home/lh/unifying-kvm/kvm.py \
   --keyboard 04d9:0024 --port /dev/ttyACM0 \
   --targets "local:_,pc:0,mac:1"
@@ -309,8 +323,7 @@ sudo python3 kvm.py ...
 
 ### 切换热键不生效
 
-- 确认是**右 Ctrl**(不是左 Ctrl)
-- 先按住右 Ctrl 不放,再按 Scroll Lock
+- 确认按的是 **Scroll Lock** 键(单键,无需组合)
 - 如果键盘没有 Scroll Lock 键,需要改代码里的热键定义
 
 ### 卡键(某个键一直按住)
@@ -339,7 +352,7 @@ python3 /home/lh/nrf52-unifying/tools/unifying.py raw "UPAIR <slot>"
 | 列出键盘 | `sudo python3 kvm.py --keyboard list` |
 | 启动(双目标) | `sudo python3 kvm.py --keyboard VID:PID --targets "local:_,pc:0"` |
 | 启动(三目标) | `sudo python3 kvm.py --keyboard VID:PID --targets "local:_,pc:0,mac:1"` |
-| 切换目标 | 右Ctrl + Scroll Lock |
+| 切换目标 | Scroll Lock |
 | 退出 | Ctrl+C |
 | 配对 slot 0 | `python3 unifying.py raw "UPAIR 00"` |
 | 配对 slot 1 | `python3 unifying.py raw "UPAIR 01"` |

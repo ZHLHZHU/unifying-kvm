@@ -9,14 +9,16 @@
 ```mermaid
 graph TD
     subgraph Pi["树莓派 (Python 3)"]
-        Keyboard["物理 USB 键盘<br/>(evdev)"]
+        Keyboard["物理 USB 键盘<br/>(evdev, 始终 grab)"]
         subgraph KVM["kvm.py"]
             KeyState["KeyState<br/>(状态机)"]
             Forwarder["Forwarder<br/>(主循环)"]
             Targets["Target[]<br/>(目标列表)"]
+            UInput["uinput 虚拟键盘<br/>(本机注入)"]
             KeyState -->|UKEYDOWN| Forwarder
+            Forwarder -->|本机模式| UInput
         end
-        Keyboard -->|"grab/ungrab"| KVM
+        Keyboard -->|"grab (永远)"| KVM
     end
 
     subgraph NRF["nRF52840 固件"]
@@ -28,7 +30,7 @@ graph TD
         RX["解密 → HID 注入 → 目标电脑"]
     end
 
-    KVM -->|"serial (CDC ACM) / USB"| NRF
+    KVM -->|"serial (CDC ACM) / USB<br/>fire-and-forget"| NRF
     NRF -->|"2.4GHz ESB (Unifying)"| Receiver
 ```
 
@@ -76,7 +78,7 @@ class Target:
     slot: int | None   # nRF52 profile slot (0-3), None 表示本机
 ```
 
-- `slot=None`:本机模式,键盘 ungrab,按键正常到 Pi
+- `slot=None`:本机模式,键盘仍 grab,按键通过 uinput 注入回 Pi
 - `slot=0..3`:远程模式,键盘 grab,按键通过 `USWITCH <slot>` + `UKEYDOWN` 转发
 
 ### 2.3 Forwarder — 主控制器
@@ -113,14 +115,11 @@ for path in evdev.list_devices():
 
 ### 3.2 独占抓取 (EVIOCGRAB)
 
-远程模式下调用 `dev.grab()`:
-- 内核不再将该设备的事件传递给其他 handler(包括 getty/X11/Wayland)
-- 只有我们的进程能读到按键
-- 防止按键"泄漏"到 Pi 本地
+键盘**始终处于 grab 状态**,不论当前目标是本机还是远程。这一设计确保进程对物理键盘 LED 的可靠控制(LED 写入需要设备被 grab)。
 
-本机模式调用 `dev.ungrab()`:
-- 键盘恢复正常,Pi 本地能收到按键
-- 我们仍在 `read_loop()` 里读事件(用于检测热键),但不转发
+- grab 后内核不再将该设备的事件传递给其他 handler(包括 getty/X11/Wayland)
+- 本机模式下,通过 uinput 虚拟键盘将按键事件注入回 OS,等效于键盘正常工作
+- 远程模式下,按键转发为 UKEYDOWN 命令发到 nRF52
 
 ### 3.3 事件循环
 
@@ -179,7 +178,30 @@ Linux evdev 键码和 USB HID usage ID 是**不同的编号体系**,需要转换
 
 ## 5. 串口通信协议
 
-### 5.1 UKEYDOWN 命令格式
+### 5.1 非阻塞 Fire-and-Forget 设计
+
+热路径(UKEYDOWN)的串口通信采用 **fire-and-forget** 模式:写入后不等待固件响应。这是为了防止事件循环被固件操作(如 USWITCH 信道扫描,可能耗时数百毫秒)阻塞。
+
+设计要点:
+- 写超时设为 0.5s(`serial.Serial(write_timeout=0.5)`)
+- 写入异常(超时、串口错误)被静默捕获,不中断事件循环
+- 丢帧不会导致状态错误:下一帧发送完整状态,自动纠正
+- 只有 USWITCH 等控制命令在切换时同步等待响应
+
+```python
+# 热路径: fire-and-forget
+try:
+    self.ser.write(f"{cmd}\n".encode())
+except (serial.SerialTimeoutException, serial.SerialException):
+    pass  # 丢帧由下一帧纠正
+```
+
+这意味着:
+- 正常情况下延迟极低(串口写入 ~1ms)
+- 固件繁忙时(扫频、重连)丢几帧按键,但不会卡住整个程序
+- 进程永远不会因串口问题崩溃,systemd 在其他异常情况下自动重启
+
+### 5.2 UKEYDOWN 命令格式
 
 KVM 使用 `UKEYDOWN`(而非 `UKEY`)发送键击。区别在于 `UKEYDOWN` 只发按下报文,不自动释放。这对状态式转发至关重要:KVM 每次状态变化发送完整的当前按键集合,由状态变化本身驱动释放。如果使用 `UKEY`(自带 press+release),当多个键重叠按下时,中间状态会各自触发一个完整的 press+release 周期,导致快速打字时出现重复按键。
 
@@ -219,7 +241,7 @@ USWITCH <slot-hex>
 3. 自动 `connect()`(wake-up 扫频重连)
 4. 返回 `SWITCHED <slot> CONNECTED` 或 `SWITCHED <slot> NOCONN`
 
-### 5.3 通信时序
+### 5.4 通信时序
 
 ```mermaid
 sequenceDiagram
@@ -229,15 +251,15 @@ sequenceDiagram
     Note over App: 按键按下
     App->>App: process_event → to_ukeydown
     App->>FW: serial.write("UKEYDOWN 00 04\n")
-    FW-->>App: serial.readline() → "OK\r\n"
+    Note over App: 不等待响应,继续处理下一事件
 
     Note over App: 按键释放
     App->>App: process_event → to_ukeydown
     App->>FW: serial.write("UKEYDOWN 00\n")
-    FW-->>App: serial.readline() → "OK\r\n"
+    Note over App: 不等待响应
 ```
 
-每个 UKEYDOWN 命令是**同步阻塞**的:发送后等待固件回复 `OK` 或 `ERR SEND`。这保证了严格的时序:前一帧被接收机确认后才发下一帧,不会堆积。
+热路径是**异步非阻塞**的:写入后立即返回,不等待固件回复。这保证了即使固件正在执行耗时操作(如 USWITCH 扫频),事件循环也不会被阻塞。丢帧由 UKEYDOWN 的状态式设计自动纠正(下一帧包含完整状态)。
 
 串口波特率 115200,一条 `UKEYDOWN 00 04\n` 约 15 字节 ≈ 1.3ms 传输时间。加上固件处理+射频发送+ACK,端到端延迟约 **3-8ms**——人感知不到。
 
@@ -247,13 +269,13 @@ sequenceDiagram
 
 ### 6.1 热键定义
 
-**右 Ctrl + Scroll Lock**
+**Scroll Lock**(单键)
 
 选择理由:
-- 右 Ctrl 日常几乎不用(大多数人用左 Ctrl)
 - Scroll Lock 在现代键盘上完全没有功能
-- 两个都是物理键盘上存在的键
+- 单键切换比组合键更快捷可靠
 - 与 IP-KVM 的传统(Scroll Lock 切换)一致
+- 物理键盘上普遍存在
 
 ### 6.2 检测逻辑
 
@@ -261,16 +283,11 @@ sequenceDiagram
 def is_hotkey(self, code, value):
     return (
         code == KEY_SCROLLLOCK
-        and value == 1                    # Scroll Lock 按下(不是释放或重复)
-        and (self.key_state.modifiers     # 右 Ctrl 当前被按住
-             & MODIFIER_KEYS[KEY_RIGHTCTRL])
+        and value == 1  # 按下(不是释放或重复)
     )
 ```
 
-关键:热键检测在 `process_event()` **之前**,所以:
-- 右 Ctrl 的按下事件正常更新 `modifiers`(被转发或被本机接收)
-- Scroll Lock 的按下事件如果触发了热键,不会被转发(被截获)
-- 如果右 Ctrl 没被按住,Scroll Lock 正常转发
+关键:热键检测在事件转发**之前**,所以 Scroll Lock 的按下事件如果触发了热键,不会被转发或注入(被截获)。
 
 ### 6.3 切换流程
 
@@ -285,40 +302,83 @@ def switch_target(self):
 
     # 3. 根据新目标类型:
     if new_target.is_local:
-        ungrab()           # 释放键盘,Pi 接管
+        # 切换到 uinput 注入模式
+        pass
     else:
-        grab()             # 独占键盘
         send(f"USWITCH {slot:02X}")  # 切 nRF52 profile
 
     # 4. 清空状态(新目标从零开始)
     key_state.clear()
+
+    # 5. LED 反馈(闪烁 Scroll Lock LED)
+    blink_led(target_blink_count)
 ```
 
 ---
 
-## 7. Grab/Ungrab 状态管理
+## 7. 键盘始终 Grab + uinput 架构
 
-### 7.1 状态转换图
+### 7.1 设计原理
+
+键盘**始终被 grab**(独占抓取),不论当前目标是本机还是远程。本机模式下通过 uinput 虚拟键盘将按键事件注入回操作系统。
+
+为什么不在本机模式下 ungrab?
+- **LED 可靠性**:只有 grab 状态下才能可靠控制物理键盘的 LED(Scroll Lock LED 用于指示目标)
+- **状态一致性**:避免 grab/ungrab 切换时的竞争条件和事件丢失
+- **简化逻辑**:事件循环始终以相同方式运行,只是输出目标不同
+
+### 7.2 状态转换图
 
 ```mermaid
 stateDiagram-v2
-    [*] --> LOCAL_Ungrabbed
-    LOCAL_Ungrabbed --> REMOTE_Grabbed : 热键
-    REMOTE_Grabbed --> REMOTE2_Grabbed : 热键 (循环)
-    REMOTE2_Grabbed --> LOCAL_Ungrabbed : 热键
-    REMOTE_Grabbed --> LOCAL_Ungrabbed : 热键
+    [*] --> LOCAL_Grabbed_UInput
+    LOCAL_Grabbed_UInput --> REMOTE_Grabbed_Serial : 热键
+    REMOTE_Grabbed_Serial --> REMOTE2_Grabbed_Serial : 热键 (循环)
+    REMOTE2_Grabbed_Serial --> LOCAL_Grabbed_UInput : 热键
+    REMOTE_Grabbed_Serial --> LOCAL_Grabbed_UInput : 热键
 ```
 
-### 7.2 关键保证
+### 7.3 关键保证
 
 - **切换时不漏键**:切之前发 `UKEYDOWN 00`(all-up)确保远程目标不会有卡住的键
 - **切换后状态干净**:清空 `key_state`,新目标从全部释放状态开始
-- **异常退出安全**:`finally` 块保证退出时 ungrab + 释放远程键
-- **本机模式仍读事件**:虽然 ungrab 了,`read_loop()` 仍在运行,这样热键检测始终有效(修饰键状态从事件流中跟踪)
+- **异常退出安全**:`finally` 块保证退出时 ungrab + 释放远程键 + 销毁 uinput 设备
+- **热键始终有效**:grab 状态下事件循环始终在读事件,热键检测永远可靠
 
 ---
 
-## 8. 延迟分析
+## 8. LED 指示
+
+### 8.1 Scroll Lock LED 闪烁协议
+
+切换目标后,物理键盘的 Scroll Lock LED 会闪烁指示当前目标:
+
+| 目标 | 闪烁次数 |
+| --- | --- |
+| PC (slot 0) | 1 次 |
+| Local | 2 次 |
+| Mac (slot 1) | 3 次 |
+
+闪烁结束后 LED **始终熄灭**(OFF 状态)。
+
+### 8.2 实现方式
+
+通过 evdev 的 `device.set_led()` 控制物理键盘的 LED:
+
+```python
+def blink_led(self, count):
+    for _ in range(count):
+        self.dev.set_led(LED_SCROLLL, 1)  # ON
+        time.sleep(0.15)
+        self.dev.set_led(LED_SCROLLL, 0)  # OFF
+        time.sleep(0.15)
+```
+
+由于键盘始终处于 grab 状态,LED 控制是可靠的——不会被内核的 LED 管理干扰。
+
+---
+
+## 9. 延迟分析
 
 端到端延迟(按键到字符出现):
 
@@ -336,7 +396,7 @@ stateDiagram-v2
 
 ---
 
-## 9. 可靠性机制
+## 10. 可靠性机制
 
 ### 9.1 固件侧保活
 
@@ -354,13 +414,20 @@ nRF52 固件在连接态下每 8ms 执行一次 `tick()`(通过 `select(read_pac
 - 丢一帧 `UKEYDOWN`(如 `ERR SEND`)只影响当帧,下一帧自动纠正
 - 不存在"按下了但释放丢了导致卡键"的问题
 
-### 9.4 切换时 all-up
+### 10.4 切换时 all-up
 
 切换目标前强制发 `UKEYDOWN 00`,即使某帧被吞,接收机也不会在旧目标上卡键。
 
+### 10.5 串口容错
+
+热路径写入超时(0.5s)和串口异常被静默捕获:
+- 进程不会因串口错误崩溃
+- systemd 配置 `Restart=on-failure` + `RestartSec=3` 在其他异常时自动重启
+- `PYTHONUNBUFFERED=1` 环境变量确保日志实时输出,方便排查
+
 ---
 
-## 10. 安全考虑
+## 11. 安全考虑
 
 - **本机 root 权限**:evdev grab 需要 root(或 input 组),转发器以 root 运行
 - **AES 加密**:所有转发的键击都经过 AES-128-CTR 加密(在 nRF52 固件里),空中无法窃听
@@ -369,7 +436,7 @@ nRF52 固件在连接态下每 8ms 执行一次 `tick()`(通过 `select(read_pac
 
 ---
 
-## 11. 局限与已知问题
+## 12. 局限与已知问题
 
 | 局限 | 说明 |
 | --- | --- |
@@ -377,12 +444,12 @@ nRF52 固件在连接态下每 8ms 执行一次 `tick()`(通过 `select(read_pac
 | 不支持多媒体键 | 音量/播放等消费者控制键未映射 |
 | 单键盘 | 只抓取一个 evdev 设备 |
 | 最多 4 个远程目标 | nRF52 flash 布局限制(4 个 profile slot) |
-| 热键固定 | 右Ctrl+ScrollLock 硬编码,修改需改代码 |
+| 热键固定 | Scroll Lock 硬编码,修改需改代码 |
 | 接收器需物理在范围内 | 2.4GHz 射频,典型 5-10m 有效距离 |
 
 ---
 
-## 12. 文件清单
+## 13. 文件清单
 
 ```
 unifying-kvm/
@@ -396,7 +463,7 @@ unifying-kvm/
 
 ---
 
-## 13. 依赖关系
+## 14. 依赖关系
 
 ```mermaid
 graph TD

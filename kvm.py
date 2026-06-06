@@ -5,10 +5,10 @@ Grabs a specified USB keyboard (by vendor:product), forwards keystrokes to a
 Logitech Unifying receiver via the nRF52 CDC dongle, and supports hotkey-based
 switching between multiple targets (local machine, PC, MacBook).
 
-Hotkey: Right Ctrl + Scroll Lock = cycle to next target.
+Hotkey: Scroll Lock = cycle to next target.
 
 Targets:
-  - "local": keyboard released (ungrabbed), keys go to this Pi normally.
+  - "local": keyboard always grabbed, keys injected back via uinput.
   - "pc" / "mac" / etc: keyboard grabbed, keys forwarded via USWITCH + UKEY.
 
 Usage:
@@ -314,7 +314,7 @@ class Forwarder:
         # Set initial LED state.
         self.blink_scroll_lock(self.target_idx + 1)
 
-        print("[KVM] Running. Right Ctrl + Scroll Lock to switch targets.")
+        print("[KVM] Running. Scroll Lock to switch targets.")
         print(f"[KVM] Targets: {', '.join(t.name for t in self.targets)}")
 
         try:
