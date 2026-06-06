@@ -252,6 +252,21 @@ class Forwarder:
                 print(f"  USWITCH -> {resp}", file=sys.stderr)
 
         self.key_state.clear()
+        # Blink Scroll Lock LED to indicate which target is now active.
+        # Number of blinks = target index + 1 (pc=1, local=2, mac=3).
+        self.blink_scroll_lock(self.target_idx + 1)
+
+    def blink_scroll_lock(self, count):
+        """Blink the Scroll Lock LED `count` times to indicate current target."""
+        try:
+            for i in range(count):
+                self.dev.set_led(ecodes.LED_SCROLLL, 1)
+                time.sleep(0.15)
+                self.dev.set_led(ecodes.LED_SCROLLL, 0)
+                if i < count - 1:
+                    time.sleep(0.15)
+        except Exception:
+            pass  # LED control is best-effort
 
     def is_hotkey(self, code, value):
         """Check if this event is the switch hotkey (RCtrl held + ScrollLock press)."""
