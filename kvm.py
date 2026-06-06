@@ -217,16 +217,26 @@ class Forwarder:
     def open_keyboard(self):
         self.dev = evdev.InputDevice(self.keyboard_path)
         print(f"Keyboard: {self.dev.name} ({self.keyboard_path})")
+        # Always grab the physical keyboard so we have full LED control
+        # and the kernel never sees raw events (which would toggle LEDs).
+        self.dev.grab()
+        self.grabbed = True
+        # Create a uinput virtual keyboard for local-mode injection.
+        # The OS sees this as a normal keyboard.
+        self.uinput = evdev.UInput.from_device(self.dev, name="KVM Virtual Keyboard")
 
     def grab(self):
-        if not self.grabbed:
-            self.dev.grab()
-            self.grabbed = True
+        # Always grabbed now — no-op kept for interface compat.
+        pass
 
     def ungrab(self):
-        if self.grabbed:
-            self.dev.ungrab()
-            self.grabbed = False
+        # Never ungrab — local mode uses uinput instead.
+        pass
+
+    def inject_local(self, event):
+        """Inject a key event into the virtual keyboard (local mode)."""
+        self.uinput.write(event.type, event.code, event.value)
+        self.uinput.syn()
 
     def switch_target(self):
         """Cycle to next target."""
@@ -239,34 +249,22 @@ class Forwarder:
         target = self.current_target
         print(f"[KVM] Switched to: {target.name}")
 
+        # LED blink: we always hold the grab so LED control is reliable.
+        self.blink_scroll_lock(self.target_idx + 1)
+
         if target.is_local:
-            self.ungrab()
-            # Put the radio to sleep — no need to keep-alive when local.
-            # USWITCH on the next remote switch will wake it back up.
             self.send_cmd("USLEEP", timeout=5)
         else:
-            self.grab()
             # Switch the nRF52 to the correct profile slot and connect.
             resp = self.send_cmd(f"USWITCH {target.slot:02X}", timeout=15)
             if self.debug:
                 print(f"  USWITCH -> {resp}", file=sys.stderr)
 
         self.key_state.clear()
-        # Blink Scroll Lock LED to indicate which target is now active.
-        # Number of blinks = target index + 1 (pc=1, local=2, mac=3).
-        self.blink_scroll_lock(self.target_idx + 1)
 
     def blink_scroll_lock(self, count):
-        """Blink the Scroll Lock LED `count` times to indicate current target."""
-        try:
-            for i in range(count):
-                self.dev.set_led(ecodes.LED_SCROLLL, 1)
-                time.sleep(0.15)
-                self.dev.set_led(ecodes.LED_SCROLLL, 0)
-                if i < count - 1:
-                    time.sleep(0.15)
-        except Exception:
-            pass  # LED control is best-effort
+        """Placeholder — LED blinking removed (unreliable on composite HID)."""
+        pass
 
     def is_hotkey(self, code, value):
         """Check if this event is the switch hotkey (RCtrl held + ScrollLock press)."""
@@ -288,11 +286,10 @@ class Forwarder:
         # Start on the first target.
         target = self.current_target
         print(f"[KVM] Active target: {target.name}")
-        if target.is_local:
-            self.ungrab()
-        else:
-            self.grab()
+        if not target.is_local:
             self.send_cmd(f"USWITCH {target.slot:02X}", timeout=15)
+        # Set initial LED state.
+        self.blink_scroll_lock(self.target_idx + 1)
 
         print("[KVM] Running. Right Ctrl + Scroll Lock to switch targets.")
         print(f"[KVM] Targets: {', '.join(t.name for t in self.targets)}")
@@ -312,11 +309,12 @@ class Forwarder:
                 if not changed:
                     continue
 
-                # If local mode, we don't forward (keyboard is ungrabbed, OS sees it).
+                # Local mode: inject into the virtual keyboard so the OS sees it.
                 if self.current_target.is_local:
+                    self.inject_local(event)
                     continue
 
-                # Forward the full current state as one UKEY report.
+                # Remote mode: forward the full current state via UKEYDOWN.
                 self.forward_key_state()
 
         except KeyboardInterrupt:
@@ -329,7 +327,15 @@ class Forwarder:
                     self.send_cmd("UKEYDOWN 00")
                 except Exception:
                     pass
-            self.ungrab()
+            # Clean up: ungrab and destroy uinput.
+            try:
+                self.dev.ungrab()
+            except Exception:
+                pass
+            try:
+                self.uinput.close()
+            except Exception:
+                pass
             self.close_serial()
 
 
