@@ -185,7 +185,7 @@ class Forwarder:
     def open_serial(self):
         if self.ser and self.ser.is_open:
             return
-        self.ser = serial.Serial(self.serial_port, 115200, timeout=1, write_timeout=10)
+        self.ser = serial.Serial(self.serial_port, 115200, timeout=1, write_timeout=0.5)
         self.ser.dtr = True
         self.ser.rts = True
         time.sleep(0.3)
@@ -214,6 +214,20 @@ class Forwarder:
             print(f"  < {resp}", file=sys.stderr)
         return resp
 
+    def send_fire_and_forget(self, cmd):
+        """Send a command without waiting for response. Used in hot path.
+        If the write fails (timeout/error), silently drop — next frame corrects."""
+        try:
+            if not self.ser or not self.ser.is_open:
+                self.open_serial()
+            if self.debug:
+                print(f"  >> {cmd}", file=sys.stderr)
+            # Drain any stale responses from previous fire-and-forget commands.
+            self.ser.reset_input_buffer()
+            self.ser.write(cmd.encode() + b"\n")
+        except Exception:
+            pass  # best-effort, next key state will retry
+
     def open_keyboard(self):
         self.dev = evdev.InputDevice(self.keyboard_path)
         print(f"Keyboard: {self.dev.name} ({self.keyboard_path})")
@@ -241,43 +255,52 @@ class Forwarder:
     def switch_target(self):
         """Cycle to next target."""
         # Release all keys on current target before switching.
-        if not self.current_target.is_local and self.key_state.keys or self.key_state.modifiers:
+        if not self.current_target.is_local and (self.key_state.keys or self.key_state.modifiers):
             self.key_state.clear()
-            self.send_cmd("UKEYDOWN 00")  # all-up report
+            self.send_fire_and_forget("UKEYDOWN 00")
 
         self.target_idx = (self.target_idx + 1) % len(self.targets)
         target = self.current_target
-        print(f"[KVM] Switched to: {target.name}")
 
-        # LED blink: we always hold the grab so LED control is reliable.
-        self.blink_scroll_lock(self.target_idx + 1)
+        # Blink IMMEDIATELY — before any blocking USWITCH/USLEEP.
+        blinks = self.target_idx + 1
+        print(f"[KVM] Switched to: {target.name} (blink {blinks})")
+        self.blink_scroll_lock(blinks)
 
         if target.is_local:
-            self.send_cmd("USLEEP", timeout=5)
+            self.send_fire_and_forget("USLEEP")
         else:
-            # Switch the nRF52 to the correct profile slot and connect.
-            resp = self.send_cmd(f"USWITCH {target.slot:02X}", timeout=15)
-            if self.debug:
-                print(f"  USWITCH -> {resp}", file=sys.stderr)
+            self.send_fire_and_forget(f"USWITCH {target.slot:02X}")
 
         self.key_state.clear()
 
     def blink_scroll_lock(self, count):
-        """Placeholder — LED blinking removed (unreliable on composite HID)."""
-        pass
+        """Blink the keyboard's Scroll Lock LED to indicate current target.
+
+        Since the keyboard is permanently grabbed (never ungrabbed), the kernel
+        cannot interfere with LED state — we have full reliable control.
+        PC=1 blink, local=2 blinks, Mac=3 blinks. Always ends OFF.
+        """
+        try:
+            self.dev.set_led(ecodes.LED_SCROLLL, 0)
+            time.sleep(0.4)
+            on_time = 0.5 if count == 1 else 0.25
+            for i in range(count):
+                self.dev.set_led(ecodes.LED_SCROLLL, 1)
+                time.sleep(on_time)
+                self.dev.set_led(ecodes.LED_SCROLLL, 0)
+                time.sleep(0.25)
+        except Exception:
+            pass
 
     def is_hotkey(self, code, value):
-        """Check if this event is the switch hotkey (RCtrl held + ScrollLock press)."""
-        return (
-            code == ecodes.KEY_SCROLLLOCK
-            and value == 1
-            and (self.key_state.modifiers & MODIFIER_KEYS[ecodes.KEY_RIGHTCTRL])
-        )
+        """Check if this event is the switch hotkey (Scroll Lock press)."""
+        return code == ecodes.KEY_SCROLLLOCK and value == 1
 
     def forward_key_state(self):
-        """Send the current key state to the nRF52 as a UKEY command."""
+        """Send the current key state to the nRF52 as a UKEYDOWN command."""
         cmd = self.key_state.to_ukey()
-        self.send_cmd(cmd)
+        self.send_fire_and_forget(cmd)
 
     def run(self):
         self.open_keyboard()
