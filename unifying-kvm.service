@@ -1,0 +1,18 @@
+[Unit]
+Description=Unifying KVM Keyboard Forwarder
+After=dev-ttyACM0.device
+Wants=dev-ttyACM0.device
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/lh/unifying-kvm/kvm.py \
+  --keyboard 04b4:4042 \
+  --port /dev/ttyACM0 \
+  --targets "pc:0,local:_,mac:1"
+Restart=on-failure
+RestartSec=5
+# Give the nRF52 time to enumerate before starting
+ExecStartPre=/bin/sleep 3
+
+[Install]
+WantedBy=multi-user.target
