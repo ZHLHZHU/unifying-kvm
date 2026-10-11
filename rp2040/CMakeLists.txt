@@ -54,7 +54,7 @@ endif()
 add_dependencies(rp2040_kvm rp2040_kvm_rust)
 target_include_directories(rp2040_kvm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/native
     "${PICO_TINYUSB_PATH}/src/portable/raspberrypi/rp2040")
-target_link_libraries(rp2040_kvm PRIVATE rp2040_kvm_core pico_stdlib tinyusb_host tinyusb_board hardware_uart hardware_irq hardware_watchdog)
+target_link_libraries(rp2040_kvm PRIVATE rp2040_kvm_core pico_stdlib tinyusb_host tinyusb_board hardware_uart hardware_irq hardware_watchdog hardware_pwm)
 pico_enable_stdio_uart(rp2040_kvm 1)
 pico_enable_stdio_usb(rp2040_kvm 0)
 pico_set_program_name(rp2040_kvm "rp2040-kvm")

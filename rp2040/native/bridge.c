@@ -6,6 +6,7 @@
 #include "hardware/uart.h"
 #include "hardware/sync.h"
 #include "hardware/watchdog.h"
+#include "hardware/pwm.h"
 #include "tusb.h"
 
 #define RX_SIZE 1024u
@@ -24,6 +25,13 @@ volatile uint32_t rp_debug_task_count;
 volatile uint32_t rp_debug_hid_reports[HID_COUNT];
 volatile uint32_t rp_debug_hid_report_len[HID_COUNT];
 volatile uint8_t rp_debug_hid_report[HID_COUNT][8];
+/* RGB on-time per channel, out of RGB_TOP+1. Equal perceived brightness uses the eye-sensitivity
+ * (Rec.709 luminance) weights R 0.2126 / G 0.7152 / B 0.0722: duty ∝ 1/weight. Blue, the least
+ * sensitive, is capped at 50% (half the old full-on brightness), so G = 50%·0.0722/0.7152 ≈ 5%,
+ * R = 50%·0.0722/0.2126 ≈ 17%. Assumes equal LED output per channel; SWD-writable for tuning,
+ * applied on the next color change. Order: R (GP16), G (GP17), B (GP18). */
+#define RGB_TOP 999u
+volatile uint16_t rp_rgb_level[3] = { 170, 50, 500 };
 
 static void uart_rx_irq(void) {
     while (uart_is_readable(uart1)) {
@@ -49,6 +57,16 @@ void bridge_init(void) {
     irq_set_exclusive_handler(UART1_IRQ, uart_rx_irq);
     irq_set_enabled(UART1_IRQ, true);
     uart_set_irq_enables(uart1, true, false);
+    /* GP16 = PWM0 A, GP17 = PWM0 B, GP18 = PWM1 A; 125kHz is far above visible flicker.
+     * Common anode: invert outputs so the compare level is the lit time. */
+    for (uint pin = 16; pin <= 18; ++pin) {
+        uint slice = pwm_gpio_to_slice_num(pin);
+        pwm_set_wrap(slice, RGB_TOP);
+        pwm_set_gpio_level(pin, 0);
+        pwm_set_output_polarity(slice, true, true);
+        pwm_set_enabled(slice, true);
+        gpio_set_function(pin, GPIO_FUNC_PWM);
+    }
 }
 
 size_t bridge_uart_read(uint8_t *out, size_t capacity) {
@@ -112,10 +130,8 @@ uint8_t bridge_hid_protocol_state(uint8_t dev, uint8_t instance) {
 }
 
 void bridge_rgb(uint8_t mask) {
-    /* Common anode: driving the cathode low lights the color. */
-    gpio_put(16, !(mask & 1u));
-    gpio_put(17, !(mask & 2u));
-    gpio_put(18, !(mask & 4u));
+    for (uint i = 0; i < 3; ++i)
+        pwm_set_gpio_level(16 + i, (mask & (1u << i)) ? (rp_rgb_level[i] > RGB_TOP + 1 ? RGB_TOP + 1 : rp_rgb_level[i]) : 0);
 }
 
 void tuh_hid_mount_cb(uint8_t dev, uint8_t instance, const uint8_t *descriptor, uint16_t len) {
