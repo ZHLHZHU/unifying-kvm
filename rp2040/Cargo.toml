@@ -1,0 +1,20 @@
+[package]
+name = "rp2040-kvm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rp2040_kvm"
+crate-type = ["staticlib", "rlib"]
+
+[features]
+uart-smoke = []
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"

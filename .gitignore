@@ -1,0 +1,4 @@
+/rp2040/build/
+/rp2040/build-uart-smoke/
+/rp2040/target/
+__pycache__/
