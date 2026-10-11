@@ -102,7 +102,20 @@ nRF 侧机制：`USWITCH` 不做 `connect()`，只配置射频，靠后台保活
 - 离开旧目标时的释放只发一次（`start_once`，`ERR SEND` 视为 `Unreached`），不会被一个关机的目标卡住。
 - `Fault::Send` 已删除；白灯只剩 UART、协议和键盘层面的真正故障。
 
-已排除的原因：Linux 端接收器 USB 自动挂起是关的（`power/control=on`），19:16 前后也没有休眠或断开记录。15 秒持续掉线的根因仍未定位，靠近到 20cm 也没恢复，更像 nRF 停在了错误信道上。
+已排除的原因：Linux 端接收器 USB 自动挂起是关的（`power/control=on`），19:16 前后也没有休眠或断开记录。
+
+## 8.5 快速连按 Scroll Lock 时白灯与灯灭：四个独立 bug
+
+不设上限之后，用户用“连不上时快速连按 Scroll Lock”稳定复现了白灯（`UART timeout`）。我写了一个常驻 SWD 日志器（50ms 轮询 KVM 状态、诊断环、PWM、USB 供电与 GPIO 复用），每次故障后再 dump RP 的 UART RX 环形缓冲，看 nRF 最后回了什么。
+
+| 现象 | 根因 | 修复 |
+| --- | --- | --- |
+| RELEASE_OLD 停 2s 后白灯 | nRF 一条 `UKEYDOWN` 连不上时阻塞约 1.4s；RP 放弃它后发的下一条要排在后面 | 先在 RP 上做了“被放弃命令计数、延长超时”，用户认为太绕，**撤回**；改为 nRF `link_up` 状态机：搜索中每条命令只试一次，约 0.1s 必回 |
+| 修完仍偶发白灯，RX 缓冲停在半截回复 | nRF 回复队列容量 1，满时 `try_send` 失败就丢回复并把 UART 标为损坏，后续请求全部作废 | 回复入队改为 `send().await` |
+| 修完仍偶发白灯，最后一条是 `ERR SEND` 后 nRF 静默 | 普通 `Uarte` 只在读 future 被轮询时接收；worker 阻塞发射频期间到达的行直接丢失 | 换 `BufferedUarte`，1KB 环形缓冲硬件持续接收 |
+| 灯灭、不能输入也不能切换，过一会自己好 | 白灯恢复时落到连不上的 slot，`RECOVER_NEW` 无限重试 all-up；该状态灯映射为熄灭且 Scroll Lock 被屏蔽 | `RECOVER_NEW` 的 all-up 改为只发一次，失败直接进 READY |
+
+复现方法都是用 SWD 驱动 RP 的 DMA 把多条命令按设定间隔直接写进 UART1 TX，看 RX 环里回了几条。手动一条一条发永远正常，这也是前几轮没抓到的原因。用户怀疑过看门狗，读 `WATCHDOG_REASON`=0、uptime 连续，排除。
 
 ## 9. 现状与待办
 
@@ -111,7 +124,7 @@ nRF 侧机制：`USWITCH` 不做 `connect()`，只配置射频，靠后台保活
 仍未完成：
 
 - nRF 切换后重连慢：可以在 `USWITCH` 时主动 `connect()` 扫全部信道，或记住每个 slot 上次成功的信道。
-- 长时间掉线根因：下次复现时同时读 nRF `USTATUS`（信道）和 Linux `journalctl`。
+- 长时间掉线（15 秒）根因：当时 nRF 每条命令阻塞 1.4s 且会丢行，可能就是这批 bug；修复后需要再观察。
 - lh-magicbook 上 Solaar 报 `No supported device found`，疑似 hidraw 权限，需要 sudo 才能排查。
 - 只绑定第一个键盘接口（iKBC 接口 1 的 NKRO 位图不读）。
 - 普通鼠标或简单键盘的对照测试、USB 电气波形、带载浪涌、掉电后配对与 counter 保留均未验证。

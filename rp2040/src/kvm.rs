@@ -135,12 +135,13 @@ impl Kvm {
         match self.state {
             State::BootVersion|State::RecoverVersion=>self.command(Command::Version,Purpose::Control,now),
             State::BootSelect=>self.command(Command::Switch(0),Purpose::Control,now),
-            // Leaving a target (or recovering from an unknown one, or re-pairing a lost one): one attempt, never block.
-            State::ReleaseOld|State::RecoverOld|State::UnplugRelease|State::PairRelease=>{
+            // One attempt, never block: leaving a target, recovering (the slot may be unreachable for a
+            // long time and Scroll Lock is inert until recovery ends), or re-pairing a lost one.
+            State::ReleaseOld|State::RecoverOld|State::RecoverNew|State::UnplugRelease|State::PairRelease=>{
                 if self.linked {self.command_once(all_up,now);} else {self.advance_unlinked(now);}
             }
-            // Entering a target: retried until it answers, blinking meanwhile.
-            State::BootRelease|State::RecoverNew|State::ReleaseNew|State::PairDone=>{
+            // Entering a target: retried until it answers, blinking meanwhile; Scroll Lock still switches away.
+            State::BootRelease|State::ReleaseNew|State::PairDone=>{
                 // Empty slots reject key reports; there is nothing to release on them.
                 if self.linked {self.command(all_up,Purpose::Control,now);} else {self.advance_unlinked(now);}
             }
@@ -205,7 +206,7 @@ impl Kvm {
             (State::RecoverStatus,Reply::Status{slot,linked})=>{self.active=slot;self.linked=linked;State::RecoverOld},
             (State::RecoverOld,Reply::Ok|Reply::Unreached)=>State::RecoverSelect,
             (State::RecoverSelect,Reply::Switched{slot,paired}) if slot==self.active=>{self.linked=paired;State::RecoverNew},
-            (State::RecoverNew,Reply::Ok)=>State::WaitRelease,
+            (State::RecoverNew,Reply::Ok|Reply::Unreached)=>State::WaitRelease,
             (State::ReleaseOld,Reply::Ok|Reply::Unreached)=>State::SelectNew,
             (State::SelectNew,Reply::Switched{slot,paired}) if slot==self.candidate=>{self.linked=paired;State::ReleaseNew},
             (State::ReleaseNew,Reply::Ok)=>{self.finish_switch();State::Ready}
@@ -318,6 +319,19 @@ pub const fn next_slot(slot:u8)->u8{(slot+1)%SLOTS}
         assert_eq!(k.state,State::WaitRelease);assert_eq!(k.active,2);assert_eq!(k.queue.len,0);
         k.input(Decode::State(physical(&[5],0)),1_000_013);k.task(1_000_014);assert_eq!(k.state,State::WaitRelease);
         k.input(Decode::State(Physical::default()),1_000_015);k.task(1_000_016);assert_eq!(k.state,State::Ready);
+    }
+    // Field 23:22:05: fault recovery landed on a slot whose receiver was out of reach. RecoverNew
+    // retried its all-up forever, the LED was off and Scroll Lock was ignored, until it reconnected.
+    #[test] fn recovery_on_unreachable_slot_reaches_ready_and_scroll_lock_works(){
+        let mut k=ready();k.fail(Fault::Timeout);
+        k.input(Decode::State(physical(&[0x47],0)),10);k.input(Decode::State(Physical::default()),11);k.task(12);
+        reply(&mut k,"VER unifying/1 build=test",13);reply(&mut k,"STATUS SLOT=1 PAIRED=1 CONN=1 CH=5 CNT=7",14);
+        reply(&mut k,"ERR SEND",15);assert_eq!(k.state,State::RecoverSelect);
+        reply(&mut k,"SWITCHED 1 CONNECTED",16);assert_eq!(k.state,State::RecoverNew);
+        reply(&mut k,"ERR SEND",17);
+        assert_eq!((k.state,k.active),(State::Ready,1));
+        tap_scroll(&mut k,&[],18);k.task(20);assert!(k.link.tx().ends_with(b"UKEYDOWN 00\n"));
+        reply(&mut k,"ERR SEND",21);assert!(k.link.tx().ends_with(b"USWITCH 02\n"));
     }
     #[test] fn noconn_switch_without_all_up_ack_faults_without_routing(){
         let mut k=ready();tap_scroll(&mut k,&[],5);k.task(6);
