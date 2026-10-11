@@ -3,6 +3,8 @@ use crate::led::Indicator;
 use crate::radio_link::{Command,Event,Fault,RadioLink,Reply,SLOTS};
 /// Holding Scroll Lock this long pairs the current slot instead of switching.
 pub const LONG_PRESS_US:u64=3_000_000;
+/// Pause between startup probes; each in-flight command retains the UART reply deadline.
+const BOOT_PROBE_US:u64=1_000_000;
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum State { BootVersion,BootSelect,BootRelease,Ready,ReleaseOld,SelectNew,ReleaseNew,
     RecoverVersion,RecoverStatus,RecoverOld,RecoverSelect,RecoverNew,WaitRelease,UnplugRelease,Fault,Maintenance,
@@ -133,7 +135,8 @@ impl Kvm {
     fn dispatch(&mut self,now:u64){
         let all_up=Command::Keys(KeyReport::default());
         match self.state {
-            State::BootVersion|State::RecoverVersion=>self.command(Command::Version,Purpose::Control,now),
+            State::BootVersion=>{if now>=self.next_probe {self.command(Command::Version,Purpose::Control,now);}},
+            State::RecoverVersion=>self.command(Command::Version,Purpose::Control,now),
             State::BootSelect=>self.command(Command::Switch(0),Purpose::Control,now),
             // One attempt, never block: leaving a target, recovering (the slot may be unreachable for a
             // long time and Scroll Lock is inert until recovery ends), or re-pairing a lost one.
@@ -180,10 +183,18 @@ impl Kvm {
     fn finish_switch(&mut self){self.active=self.candidate;self.queue.pop();self.action_pending=false;}
     fn handle(&mut self,event:Event,now:u64){
         let reply=match event{Event::Fault(f)=>{
+            // nRF may start later than RP. Restart only the boot handshake on silence;
+            // runtime failures and malformed replies still require explicit recovery.
+            if f==Fault::Timeout&&matches!(self.state,State::BootVersion|State::BootSelect|State::BootRelease) {
+                self.clear_inputs();self.state=State::BootVersion;self.next_probe=now+BOOT_PROBE_US;return;
+            }
             if self.state==State::Maintenance {self.next_probe=now+1_000_000;self.fault=Some(f);return;}
             self.fail(f);return;
         },Event::Reply(r)=>r};
         if reply==Reply::Busy {
+            if matches!(self.state,State::BootVersion|State::BootSelect|State::BootRelease) {
+                self.clear_inputs();self.state=State::BootVersion;self.next_probe=now+BOOT_PROBE_US;return;
+            }
             self.clear_inputs();self.state=State::Maintenance;self.next_probe=now+1_000_000;return;
         }
         match self.purpose {
@@ -240,6 +251,38 @@ pub const fn next_slot(slot:u8)->u8{(slot+1)%SLOTS}
     fn tap_scroll(k:&mut Kvm,held:&[u8],now:u64){
         let mut with=held.to_vec();with.push(0x47);
         k.input(Decode::State(physical(&with,0)),now);k.input(Decode::State(physical(held,0)),now+1);
+    }
+    #[test] fn delayed_nrf_startup_waits_then_initializes_without_replaying_keys(){
+        let mut k=Kvm::new();k.mount();k.task(0);
+        let first=k.link.tx()[..9].to_vec();k.link.written(k.link.tx().len());
+        k.input(Decode::State(physical(&[4],0)),1);
+        k.task(2_000_000);
+        assert_eq!((k.state,k.fault),(State::BootVersion,None));
+        assert!(k.link.tx().is_empty());assert_eq!(k.queue.len,0);
+        k.task(2_999_999);assert!(k.link.tx().is_empty());
+        k.task(3_000_000);assert_ne!(&k.link.tx()[..9],first.as_slice());
+        reply(&mut k,"ERR BUSY",3_000_001);
+        assert_eq!((k.state,k.fault),(State::BootVersion,None));
+        k.task(4_000_000);assert!(k.link.tx().is_empty());
+        k.task(4_000_001);reply(&mut k,"VER unifying/1 build=test",4_000_002);
+        reply(&mut k,"SWITCHED 0 CONNECTED",4_000_003);reply(&mut k,"OK",4_000_004);
+        assert_eq!(k.state,State::WaitRelease);assert_eq!(k.queue.len,0);
+        k.input(Decode::State(Physical::default()),4_000_005);k.task(4_000_005);
+        assert_eq!(k.state,State::Ready);
+        k.input(Decode::State(physical(&[5],0)),4_000_006);k.task(4_000_006);
+        assert!(k.link.tx().ends_with(b"UKEYDOWN 00 05\n"));
+    }
+    #[test] fn boot_selection_timeout_restarts_probe_but_runtime_timeout_faults(){
+        let mut k=Kvm::new();k.task(0);reply(&mut k,"VER unifying/1 build=test",1);
+        k.link.written(k.link.tx().len());k.task(2_000_001);
+        assert_eq!((k.state,k.fault),(State::BootVersion,None));
+        k.task(3_000_001);reply(&mut k,"VER unifying/1 build=test",3_000_002);
+        reply(&mut k,"SWITCHED 0 CONNECTED",3_000_003);
+        k.link.written(k.link.tx().len());k.task(5_000_003);
+        assert_eq!((k.state,k.fault),(State::BootVersion,None));
+        let mut running=ready();running.task(1_000_004);
+        running.link.written(running.link.tx().len());running.task(3_000_004);
+        assert_eq!((running.state,running.fault),(State::Fault,Some(Fault::Timeout)));
     }
     #[test] fn short_press_release_preserves_fifo(){
         let mut k=ready();k.input(Decode::State(physical(&[4],0)),5);k.input(Decode::State(Physical::default()),6);k.task(7);
