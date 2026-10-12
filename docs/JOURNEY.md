@@ -131,7 +131,7 @@ nRF 侧机制：`USWITCH` 不做 `connect()`，只配置射频，靠后台保活
 
 仍未完成：
 
-- nRF 切换后重连慢：可以在 `USWITCH` 时主动 `connect()` 扫全部信道，或记住每个 slot 上次成功的信道。
+- nRF 切换后重连：接收器移离 USB 3.0 后实测 18 次 slot 0↔1 切换（停留 1.5s 或 30s），从 `USWITCH` 到首个按键 ACK 为 0.03–0.84s，中位约 0.2s，未改代码。此前 6–8s 的情况发生在 USB 3.0 干扰和 nRF 每条命令阻塞 1.4s 的时期；若再出现秒级重连，先查干扰再考虑缩短搜索时每信道重试。
 - 长时间掉线（15 秒）根因：当时 nRF 每条命令阻塞 1.4s 且会丢行，可能就是这批 bug；修复后需要再观察。
 - lh-magicbook 上 Solaar 报 `No supported device found`，疑似 hidraw 权限，需要 sudo 才能排查。
 - 只绑定第一个键盘接口（iKBC 接口 1 的 NKRO 位图不读）。
